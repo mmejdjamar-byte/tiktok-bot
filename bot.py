@@ -41,7 +41,7 @@ from telegram.ext import (
 # ---------------------------------------------------------------------------
 
 # ضع التوكن هنا مباشرة أو استخدم متغير بيئة BOT_TOKEN (يفضل الأخير للأمان)
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8620938786:AAEaJYJLzcc7Fn3pOQjvaUzhnmYzRiBkIO4")
 
 # الـ Chat ID الخاص بمالك البوت، تستخدم لتوصيل رسائل الدعم الفني إليه مباشرة
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "8675217264")
