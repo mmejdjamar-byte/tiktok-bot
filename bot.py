@@ -25,12 +25,13 @@ import tempfile
 import shutil
 
 import yt_dlp
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -56,6 +57,10 @@ logger = logging.getLogger(__name__)
 
 # نتتبع فيها المستخدمين اللي ضغطوا /support وننتظر رسالتهم التالية
 users_awaiting_support = set()
+
+# نخزن هنا الرابط المنتظر اختيار المستخدم (فيديو/صوت) لحظة الضغط على الزر
+# المفتاح: user_id ، القيمة: (الرابط, اسم المنصة)
+pending_downloads = {}
 
 TIKTOK_URL_REGEX = re.compile(
     r"(https?://)?(www\.|vm\.|vt\.)?tiktok\.com/\S+", re.IGNORECASE
@@ -86,27 +91,62 @@ def extract_supported_url(text: str) -> tuple[str, str] | tuple[None, None]:
     return None, None
 
 
-def download_video(url: str, download_dir: str) -> str:
+def download_video(url: str, download_dir: str, audio_only: bool = False) -> str:
     """
     يحمّل فيديو (تيك توك بدون علامة مائية، أو يوتيوب) باستخدام yt-dlp.
+    لو audio_only=True، يستخرج الصوت فقط ويحوّله لملف MP3.
     يرجع مسار الملف المحمّل.
     """
     output_template = os.path.join(download_dir, "%(id)s.%(ext)s")
 
-    ydl_opts = {
-        "outtmpl": output_template,
-        # نحدد الجودة لأقصى 720p عشان نقلل احتمال تجاوز حد تيليجرام (50 ميجا)
-        # خصوصًا لمقاطع يوتيوب اللي ممكن تكون طويلة أو عالية الجودة
-        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-    }
+    if audio_only:
+        ydl_opts = {
+            "outtmpl": output_template,
+            "format": "bestaudio/best",
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "web"],
+                }
+            },
+        }
+    else:
+        ydl_opts = {
+            "outtmpl": output_template,
+            # نحدد الجودة لأقصى 720p عشان نقلل احتمال تجاوز حد تيليجرام (50 ميجا)
+            # خصوصًا لمقاطع يوتيوب اللي ممكن تكون طويلة أو عالية الجودة
+            "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            "merge_output_format": "mp4",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            # حل شائع لمشاكل يوتيوب المتكررة (تغيير التوقيع/كشف البوتات):
+            # نطلب البيانات وكأننا تطبيق أندرويد الرسمي بدل متصفح ويب
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "web"],
+                }
+            },
+        }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filepath = ydl.prepare_filename(info)
+
+        if audio_only:
+            # بعد المعالجة (FFmpegExtractAudio)، الامتداد يتغيّر فعليًا لـ mp3
+            base, _ = os.path.splitext(filepath)
+            filepath = base + ".mp3"
+
         return filepath
 
 
@@ -135,6 +175,7 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "المميزات:\n"
         "— جودة مطابقة للنسخة الأصلية دون أي ضغط أو تعديل إضافي\n"
         "— بدون علامات مائية إضافية من البوت نفسه\n"
+        "— خيار تحميل الصوت فقط (MP3)\n"
         "— معالجة مباشرة وسريعة\n\n"
         "الأوامر المتاحة:\n"
         "/start — رسالة البداية\n"
@@ -167,9 +208,47 @@ async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    يلتقط ردود الأدمن على رسائل الدعم المُوجّهة (عبر خاصية Reply في تيليجرام)
+    ويرسلها تلقائيًا للمستخدم الأصلي صاحب المشكلة.
+    """
+    replied_message = update.message.reply_to_message
+    if not replied_message or not replied_message.text:
+        return
+
+    # نبحث عن سطر "معرف المستخدم: <رقم>" داخل الرسالة الأصلية المُوجّهة
+    match = re.search(r"معرف المستخدم:\s*(\d+)", replied_message.text)
+    if not match:
+        return  # الرسالة المردود عليها مو رسالة دعم موجّهة من البوت
+
+    target_user_id = int(match.group(1))
+    reply_text = update.message.text or ""
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"💬 رد من فريق الدعم:\n\n{reply_text}",
+        )
+        await update.message.reply_text("✅ تم إرسال الرد للمستخدم.")
+    except Exception:
+        logger.exception("فشل إرسال رد الأدمن للمستخدم")
+        await update.message.reply_text(
+            "❌ تعذّر إرسال الرد. قد يكون المستخدم حظر البوت أو حذف المحادثة."
+        )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     user = update.effective_user
+
+    # لو هذي رسالة من الأدمن نفسه، وهي رد (Reply) على رسالة دعم موجّهة، نعالجها بشكل منفصل
+    if (
+        str(user.id) == str(ADMIN_CHAT_ID)
+        and update.message.reply_to_message is not None
+    ):
+        await handle_admin_reply(update, context)
+        return
 
     # لو المستخدم بوضع "انتظار رسالة دعم"، نوجّه رسالته للأدمن بدل معالجتها كرابط
     if user.id in users_awaiting_support:
@@ -180,7 +259,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📩 رسالة دعم جديدة\n\n"
             f"من: {user.full_name} ({username_display})\n"
             f"معرف المستخدم: {user.id}\n\n"
-            f"الرسالة:\n{text}"
+            f"الرسالة:\n{text}\n\n"
+            f"↩️ للرد: اعمل Reply على هذه الرسالة واكتب ردك مباشرة"
         )
 
         try:
@@ -203,44 +283,91 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    status_msg = await update.message.reply_text("⏳ جاري تحميل المقطع...")
+    # نخزن الرابط مؤقتًا وننتظر اختيار المستخدم (فيديو أو صوت)
+    pending_downloads[user.id] = (url, platform)
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🎥 فيديو", callback_data="download_video"),
+                InlineKeyboardButton("🎵 صوت (MP3)", callback_data="download_audio"),
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        "اختر صيغة التحميل المطلوبة:",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_download_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    يعالج ضغط المستخدم على أحد زري (فيديو / صوت) ويبدأ التحميل بالصيغة المختارة.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    pending = pending_downloads.pop(user_id, None)
+
+    if pending is None:
+        await query.edit_message_text(
+            "⚠️ انتهت صلاحية هذا الطلب. أرسل الرابط من جديد."
+        )
+        return
+
+    url, platform = pending
+    audio_only = query.data == "download_audio"
+
+    await query.edit_message_text("⏳ جاري التحميل...")
     await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VIDEO
+        chat_id=query.message.chat_id,
+        action=ChatAction.UPLOAD_AUDIO if audio_only else ChatAction.UPLOAD_VIDEO,
     )
 
     temp_dir = tempfile.mkdtemp()
     try:
-        filepath = download_video(url, temp_dir)
+        filepath = download_video(url, temp_dir, audio_only=audio_only)
 
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
         if size_mb > MAX_FILE_SIZE_MB:
-            await status_msg.edit_text(
-                f"⚠️ حجم الفيديو ({size_mb:.1f} ميجا) أكبر من الحد المسموح "
+            await query.edit_message_text(
+                f"⚠️ حجم الملف ({size_mb:.1f} ميجا) أكبر من الحد المسموح "
                 f"({MAX_FILE_SIZE_MB} ميجا) لإرساله عبر البوت."
             )
             return
 
-        caption = (
-            "✅ تفضل، بدون علامة مائية!"
-            if platform == "tiktok"
-            else "✅ تفضل، هذا المقطع من يوتيوب!"
-        )
-        with open(filepath, "rb") as video_file:
-            await update.message.reply_video(
-                video=video_file,
-                caption=caption,
+        if audio_only:
+            with open(filepath, "rb") as audio_file:
+                await context.bot.send_audio(
+                    chat_id=query.message.chat_id,
+                    audio=audio_file,
+                    caption="✅ تفضل، الصوت جاهز!",
+                )
+        else:
+            caption = (
+                "✅ تفضل، بدون علامة مائية!"
+                if platform == "tiktok"
+                else "✅ تفضل، هذا المقطع من يوتيوب!"
             )
-        await status_msg.delete()
+            with open(filepath, "rb") as video_file:
+                await context.bot.send_video(
+                    chat_id=query.message.chat_id,
+                    video=video_file,
+                    caption=caption,
+                )
+
+        await query.delete_message()
 
     except yt_dlp.utils.DownloadError as e:
         logger.error("خطأ تحميل: %s", e)
-        await status_msg.edit_text(
+        await query.edit_message_text(
             "❌ تعذّر تحميل المقطع. تأكد من صحة الرابط ومن أن المقطع غير خاص أو محذوف.\n\n"
             "إذا استمرت المشكلة، تواصل مع الدعم الفني عبر /support"
         )
     except Exception as e:
         logger.exception("خطأ غير متوقع")
-        await status_msg.edit_text(f"❌ صار خطأ غير متوقع: {e}")
+        await query.edit_message_text(f"❌ صار خطأ غير متوقع: {e}")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -278,6 +405,7 @@ def main():
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("support", support_command))
+    app.add_handler(CallbackQueryHandler(handle_download_choice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("البوت شغال...")
