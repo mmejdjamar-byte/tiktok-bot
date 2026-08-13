@@ -42,6 +42,9 @@ from telegram.ext import (
 # ضع التوكن هنا مباشرة أو استخدم متغير بيئة BOT_TOKEN (يفضل الأخير للأمان)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
+# الـ Chat ID الخاص بمالك البوت، تستخدم لتوصيل رسائل الدعم الفني إليه مباشرة
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "8675217264")
+
 # الحد الأقصى لحجم الملف الذي يسمح تيليجرام برفعه عبر البوت (50 ميجا تقريبًا للبوتات العادية)
 MAX_FILE_SIZE_MB = 50
 
@@ -50,6 +53,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# نتتبع فيها المستخدمين اللي ضغطوا /support وننتظر رسالتهم التالية
+users_awaiting_support = set()
 
 TIKTOK_URL_REGEX = re.compile(
     r"(https?://)?(www\.|vm\.|vt\.)?tiktok\.com/\S+", re.IGNORECASE
@@ -110,28 +116,85 @@ def download_video(url: str, download_dir: str) -> str:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "أهلاً! 👋\n\n"
-        "أرسل لي رابط مقطع من تيك توك أو يوتيوب وراح أحمّله لك.\n\n"
+        "أهلاً بك. 👋\n\n"
+        "أرسل رابط مقطع من تيك توك أو يوتيوب وسيتم تحميله لك بأعلى جودة متاحة.\n\n"
         "أمثلة:\n"
         "https://www.tiktok.com/@username/video/1234567890\n"
-        "https://www.youtube.com/watch?v=xxxxxxxxxxx"
+        "https://www.youtube.com/watch?v=xxxxxxxxxxx\n\n"
+        "لمعرفة إمكانيات البوت: /about\n"
+        "للدعم الفني: /support"
+    )
+
+
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 نبذة عن البوت\n\n"
+        "هذا البوت مخصص لتحميل المقاطع من المنصات التالية:\n\n"
+        "• تيك توك — بدون علامة مائية\n"
+        "• يوتيوب\n\n"
+        "المميزات:\n"
+        "— جودة مطابقة للنسخة الأصلية دون أي ضغط أو تعديل إضافي\n"
+        "— بدون علامات مائية إضافية من البوت نفسه\n"
+        "— معالجة مباشرة وسريعة\n\n"
+        "الأوامر المتاحة:\n"
+        "/start — رسالة البداية\n"
+        "/help — طريقة الاستخدام\n"
+        "/about — هذه الرسالة\n"
+        "/support — التواصل مع الدعم الفني"
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔹 كيف تستخدم البوت:\n\n"
+        "🔹 طريقة الاستخدام\n\n"
         "1. انسخ رابط مقطع من تيك توك أو يوتيوب\n"
-        "2. أرسله هنا مباشرة\n"
-        "3. انتظر شوي وراح يرجع لك الفيديو بأعلى جودة متاحة\n\n"
+        "2. أرسله في هذه المحادثة\n"
+        "3. انتظر قليلاً وسيتم إرسال الفيديو بأعلى جودة متاحة\n\n"
         "الأوامر المتاحة:\n"
-        "/start - رسالة الترحيب\n"
-        "/help - هذي الرسالة"
+        "/start — رسالة البداية\n"
+        "/about — إمكانيات البوت\n"
+        "/help — هذه الرسالة\n"
+        "/support — التواصل مع الدعم الفني"
+    )
+
+
+async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users_awaiting_support.add(update.effective_user.id)
+    await update.message.reply_text(
+        "🛠️ الدعم الفني\n\n"
+        "يرجى وصف المشكلة أو الاستفسار في رسالة واحدة، "
+        "وستصل مباشرة إلى فريق الدعم للمتابعة."
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
+    user = update.effective_user
+
+    # لو المستخدم بوضع "انتظار رسالة دعم"، نوجّه رسالته للأدمن بدل معالجتها كرابط
+    if user.id in users_awaiting_support:
+        users_awaiting_support.discard(user.id)
+
+        username_display = f"@{user.username}" if user.username else "بدون يوزرنيم"
+        forward_text = (
+            f"📩 رسالة دعم جديدة\n\n"
+            f"من: {user.full_name} ({username_display})\n"
+            f"معرف المستخدم: {user.id}\n\n"
+            f"الرسالة:\n{text}"
+        )
+
+        try:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=forward_text)
+            await update.message.reply_text(
+                "✅ تم إرسال رسالتك لفريق الدعم، سيتم التواصل معك في أقرب وقت."
+            )
+        except Exception:
+            logger.exception("فشل توجيه رسالة الدعم")
+            await update.message.reply_text(
+                "❌ حدث خطأ أثناء إرسال رسالتك، حاول مرة أخرى لاحقًا."
+            )
+        return
+
     url, platform = extract_supported_url(text)
 
     if not url:
@@ -172,7 +235,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except yt_dlp.utils.DownloadError as e:
         logger.error("خطأ تحميل: %s", e)
         await status_msg.edit_text(
-            "❌ ما قدرت أحمّل المقطع. تأكد إن الرابط صحيح وإن المقطع غير خاص/محذوف."
+            "❌ تعذّر تحميل المقطع. تأكد من صحة الرابط ومن أن المقطع غير خاص أو محذوف.\n\n"
+            "إذا استمرت المشكلة، تواصل مع الدعم الفني عبر /support"
         )
     except Exception as e:
         logger.exception("خطأ غير متوقع")
@@ -195,7 +259,9 @@ async def setup_commands(app):
     await app.bot.set_my_commands(
         [
             BotCommand("start", "بدء استخدام البوت"),
+            BotCommand("about", "إمكانيات البوت"),
             BotCommand("help", "طريقة الاستخدام"),
+            BotCommand("support", "التواصل مع الدعم الفني"),
         ]
     )
 
@@ -209,7 +275,9 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(setup_commands).build()
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("support", support_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("البوت شغال...")
