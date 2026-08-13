@@ -1,8 +1,8 @@
 """
-بوت تيليجرام لتحميل مقاطع تيك توك بدون علامة مائية.
+بوت تيليجرام لتحميل مقاطع تيك توك (بدون علامة مائية) ويوتيوب.
 
 الفكرة:
-- المستخدم يرسل رابط تيك توك للبوت.
+- المستخدم يرسل رابط تيك توك أو يوتيوب للبوت.
 - البوت يستخدم مكتبة yt-dlp لتحميل الفيديو (النسخة الأصلية بدون شعار تيك توك).
 - البوت يرسل الفيديو للمستخدم مباشرة داخل تيليجرام.
 
@@ -55,27 +55,44 @@ TIKTOK_URL_REGEX = re.compile(
     r"(https?://)?(www\.|vm\.|vt\.)?tiktok\.com/\S+", re.IGNORECASE
 )
 
+YOUTUBE_URL_REGEX = re.compile(
+    r"(https?://)?(www\.|m\.)?(youtube\.com/\S+|youtu\.be/\S+)", re.IGNORECASE
+)
+
 
 # ---------------------------------------------------------------------------
 # دوال المساعدة
 # ---------------------------------------------------------------------------
 
-def extract_tiktok_url(text: str) -> str | None:
-    """يستخرج رابط تيك توك من نص الرسالة إن وُجد."""
-    match = TIKTOK_URL_REGEX.search(text)
-    return match.group(0) if match else None
-
-
-def download_tiktok_video(url: str, download_dir: str) -> str:
+def extract_supported_url(text: str) -> tuple[str, str] | tuple[None, None]:
     """
-    يحمّل فيديو تيك توك بدون علامة مائية باستخدام yt-dlp.
+    يستخرج رابط تيك توك أو يوتيوب من نص الرسالة إن وُجد.
+    يرجع (الرابط, اسم المنصة) أو (None, None) إن لم يوجد رابط مدعوم.
+    """
+    tiktok_match = TIKTOK_URL_REGEX.search(text)
+    if tiktok_match:
+        return tiktok_match.group(0), "tiktok"
+
+    youtube_match = YOUTUBE_URL_REGEX.search(text)
+    if youtube_match:
+        return youtube_match.group(0), "youtube"
+
+    return None, None
+
+
+def download_video(url: str, download_dir: str) -> str:
+    """
+    يحمّل فيديو (تيك توك بدون علامة مائية، أو يوتيوب) باستخدام yt-dlp.
     يرجع مسار الملف المحمّل.
     """
     output_template = os.path.join(download_dir, "%(id)s.%(ext)s")
 
     ydl_opts = {
         "outtmpl": output_template,
-        "format": "mp4/best",
+        # نحدد الجودة لأقصى 720p عشان نقلل احتمال تجاوز حد تيليجرام (50 ميجا)
+        # خصوصًا لمقاطع يوتيوب اللي ممكن تكون طويلة أو عالية الجودة
+        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -94,19 +111,32 @@ def download_tiktok_video(url: str, download_dir: str) -> str:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً! 👋\n\n"
-        "أرسل لي رابط أي مقطع من تيك توك وراح أحمّله لك بدون العلامة المائية.\n\n"
-        "مثال:\n"
-        "https://www.tiktok.com/@username/video/1234567890"
+        "أرسل لي رابط مقطع من تيك توك أو يوتيوب وراح أحمّله لك.\n\n"
+        "أمثلة:\n"
+        "https://www.tiktok.com/@username/video/1234567890\n"
+        "https://www.youtube.com/watch?v=xxxxxxxxxxx"
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔹 كيف تستخدم البوت:\n\n"
+        "1. انسخ رابط مقطع من تيك توك أو يوتيوب\n"
+        "2. أرسله هنا مباشرة\n"
+        "3. انتظر شوي وراح يرجع لك الفيديو بأعلى جودة متاحة\n\n"
+        "الأوامر المتاحة:\n"
+        "/start - رسالة الترحيب\n"
+        "/help - هذي الرسالة"
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
-    url = extract_tiktok_url(text)
+    url, platform = extract_supported_url(text)
 
     if not url:
         await update.message.reply_text(
-            "ما لقيت رابط تيك توك صحيح في رسالتك. تأكد إنك أرسلت رابط المقطع كامل."
+            "ما لقيت رابط مدعوم في رسالتك. أرسل رابط من تيك توك أو يوتيوب."
         )
         return
 
@@ -117,7 +147,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     temp_dir = tempfile.mkdtemp()
     try:
-        filepath = download_tiktok_video(url, temp_dir)
+        filepath = download_video(url, temp_dir)
 
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
         if size_mb > MAX_FILE_SIZE_MB:
@@ -127,10 +157,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        caption = (
+            "✅ تفضل، بدون علامة مائية!"
+            if platform == "tiktok"
+            else "✅ تفضل، هذا المقطع من يوتيوب!"
+        )
         with open(filepath, "rb") as video_file:
             await update.message.reply_video(
                 video=video_file,
-                caption="✅ تفضل، بدون علامة مائية!",
+                caption=caption,
             )
         await status_msg.delete()
 
@@ -150,15 +185,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # نقطة التشغيل
 # ---------------------------------------------------------------------------
 
+async def setup_commands(app):
+    """
+    يسجّل قائمة الأوامر عند تيليجرام عشان تظهر بقائمة "/" أو "≡"
+    جنب صندوق الكتابة داخل شات البوت.
+    """
+    from telegram import BotCommand
+
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "بدء استخدام البوت"),
+            BotCommand("help", "طريقة الاستخدام"),
+        ]
+    )
+
+
 def main():
     if not BOT_TOKEN or BOT_TOKEN == "ضع_توكن_البوت_هنا":
         raise SystemExit(
             "الرجاء ضبط توكن البوت أولاً (متغير BOT_TOKEN أو داخل الكود مباشرة)."
         )
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(setup_commands).build()
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("البوت شغال...")
